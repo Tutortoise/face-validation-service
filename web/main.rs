@@ -16,6 +16,7 @@ async fn main() -> std::io::Result<()> {
     let environment = Arc::new(
         Environment::builder()
             .with_name("face-validation")
+            .with_log_level(ort::LoggingLevel::Warning)
             .build()
             .unwrap(),
     );

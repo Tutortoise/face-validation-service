@@ -1,41 +1,33 @@
 use crate::types::{Detection, DEFAULT_CLUSTER_SIZE, IOU_THRESHOLD};
 use dbscan::cluster;
+use rayon::prelude::*;
 
 pub fn cluster_boxes(detections: &mut Vec<Detection>) -> Vec<[i32; 4]> {
     if detections.is_empty() {
         return Vec::new();
     }
 
-    let points: Vec<Vec<f64>> = detections
-        .iter()
-        .map(|det| {
-            vec![
-                det.bbox[0] as f64,
-                det.bbox[1] as f64,
-                det.bbox[2] as f64,
-                det.bbox[3] as f64,
-            ]
-        })
-        .collect();
+    let mut points = Vec::with_capacity(detections.len());
+    points.par_extend(detections.par_iter().map(|det| {
+        vec![
+            det.bbox[0] as f64,
+            det.bbox[1] as f64,
+            det.bbox[2] as f64,
+            det.bbox[3] as f64,
+        ]
+    }));
 
-    let median_size = calculate_median_size(detections);
-    let eps = if median_size.is_finite() && median_size > 0.0 {
-        median_size * 0.5
-    } else {
-        DEFAULT_CLUSTER_SIZE
-    };
-
+    let eps = calculate_median_size(detections).max(DEFAULT_CLUSTER_SIZE) * 0.5;
     let min_points = if detections.len() > 3 { 2 } else { 1 };
-    let mut clusters = cluster(eps, min_points, &points);
 
-    if clusters
+    let clusters = cluster(eps, min_points, &points);
+    if !clusters
         .iter()
         .all(|c| matches!(c, dbscan::Classification::Noise))
     {
-        clusters = cluster(eps * 1.5, min_points, &points);
+        return process_clusters(detections, clusters);
     }
-
-    process_clusters(detections, clusters)
+    process_clusters(detections, cluster(eps * 1.5, min_points, &points))
 }
 
 fn calculate_median_size(detections: &[Detection]) -> f64 {
@@ -130,7 +122,6 @@ fn finalize_clusters(
     final_boxes.to_vec()
 }
 
-// All the clustering helper functions:
 pub fn safe_f64_cmp(a: &f64, b: &f64) -> std::cmp::Ordering {
     match (a.is_nan(), b.is_nan()) {
         (true, true) => std::cmp::Ordering::Equal,

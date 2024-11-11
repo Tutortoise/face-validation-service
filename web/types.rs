@@ -1,5 +1,6 @@
 use ort::Environment;
 use serde::Serialize;
+
 use std::{fmt, sync::Arc};
 
 // Constants

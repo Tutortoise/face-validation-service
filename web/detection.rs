@@ -3,8 +3,9 @@ use crate::{
     types::{Detection, CONF_THRESHOLD, INPUT_SIZE},
 };
 use image::DynamicImage;
-use ndarray::{Array, CowArray};
+use ndarray::{Array, ArrayView1, CowArray};
 use ort::{Session, Value};
+use rayon::prelude::*;
 
 pub async fn process_image(
     image: DynamicImage,
@@ -20,18 +21,21 @@ pub async fn process_image(
         &rgb_image,
         INPUT_SIZE.0,
         INPUT_SIZE.1,
-        image::imageops::FilterType::Lanczos3,
+        image::imageops::FilterType::Triangle,
     );
 
     let mut input_data = Vec::with_capacity((INPUT_SIZE.0 * INPUT_SIZE.1 * 3) as usize);
-
     for c in 0..3 {
-        for y in 0..INPUT_SIZE.1 {
-            for x in 0..INPUT_SIZE.0 {
-                let pixel = resized.get_pixel(x, y);
-                input_data.push(pixel[c] as f32 / 255.0);
-            }
-        }
+        let channel_data: Vec<f32> = (0..INPUT_SIZE.1)
+            .into_par_iter()
+            .flat_map(|y| {
+                let row_pixels: Vec<f32> = (0..INPUT_SIZE.0)
+                    .map(|x| resized.get_pixel(x, y)[c] as f32 / 255.0)
+                    .collect();
+                row_pixels
+            })
+            .collect();
+        input_data.extend(channel_data);
     }
 
     // Create input tensor
@@ -59,53 +63,72 @@ pub async fn process_image(
         .to_owned()
         .into_shape((8400, 5))?;
 
-    let mut detections = Vec::new();
+    let detections: Vec<Detection> = predictions
+        .axis_iter(ndarray::Axis(0))
+        .par_bridge()
+        .filter_map(|prediction| {
+            let confidence = prediction[4];
+            if confidence >= CONF_THRESHOLD {
+                // Process detection in parallel
+                Some(create_detection(
+                    prediction,
+                    original_width,
+                    original_height,
+                    confidence,
+                ))
+            } else {
+                None
+            }
+        })
+        .collect();
 
-    for prediction in predictions.outer_iter() {
-        let confidence = prediction[4];
-        if confidence >= CONF_THRESHOLD {
-            let x_center = prediction[0];
-            let y_center = prediction[1];
-            let width = prediction[2];
-            let height = prediction[3];
+    // Sort after parallel processing
+    let mut detections = detections;
+    detections.par_sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
-            // Convert normalized coordinates to absolute pixel coordinates
-            let abs_x_center = x_center * INPUT_SIZE.0 as f32;
-            let abs_y_center = y_center * INPUT_SIZE.1 as f32;
-            let abs_width = width * INPUT_SIZE.0 as f32;
-            let abs_height = height * INPUT_SIZE.1 as f32;
+    Ok(cluster_boxes(&mut detections))
+}
 
-            // Calculate corner coordinates in input size space
-            let x1 = (abs_x_center - abs_width / 2.0).round() as i32;
-            let y1 = (abs_y_center - abs_height / 2.0).round() as i32;
-            let x2 = (abs_x_center + abs_width / 2.0).round() as i32;
-            let y2 = (abs_y_center + abs_height / 2.0).round() as i32;
+#[inline(always)]
+fn create_detection(
+    prediction: ArrayView1<f32>,
+    original_width: u32,
+    original_height: u32,
+    confidence: f32,
+) -> Detection {
+    let x_center = prediction[0];
+    let y_center = prediction[1];
+    let width = prediction[2];
+    let height = prediction[3];
 
-            // Scale to original image size
-            let scale_x = original_width as f32 / INPUT_SIZE.0 as f32;
-            let scale_y = original_height as f32 / INPUT_SIZE.1 as f32;
+    // Convert normalized coordinates to absolute pixel coordinates
+    let abs_x_center = x_center * INPUT_SIZE.0 as f32;
+    let abs_y_center = y_center * INPUT_SIZE.1 as f32;
+    let abs_width = width * INPUT_SIZE.0 as f32;
+    let abs_height = height * INPUT_SIZE.1 as f32;
 
-            let x1 = (x1 as f32 * scale_x).round() as i32;
-            let y1 = (y1 as f32 * scale_y).round() as i32;
-            let x2 = (x2 as f32 * scale_x).round() as i32;
-            let y2 = (y2 as f32 * scale_y).round() as i32;
+    // Calculate corner coordinates in input size space
+    let x1 = (abs_x_center - abs_width / 2.0).round() as i32;
+    let y1 = (abs_y_center - abs_height / 2.0).round() as i32;
+    let x2 = (abs_x_center + abs_width / 2.0).round() as i32;
+    let y2 = (abs_y_center + abs_height / 2.0).round() as i32;
 
-            // Ensure coordinates are within image bounds
-            let bbox = [
-                x1.max(0),
-                y1.max(0),
-                x2.min(original_width as i32),
-                y2.min(original_height as i32),
-            ];
+    // Scale to original image size
+    let scale_x = original_width as f32 / INPUT_SIZE.0 as f32;
+    let scale_y = original_height as f32 / INPUT_SIZE.1 as f32;
 
-            detections.push(Detection { bbox, confidence });
-        }
-    }
+    let x1 = (x1 as f32 * scale_x).round() as i32;
+    let y1 = (y1 as f32 * scale_y).round() as i32;
+    let x2 = (x2 as f32 * scale_x).round() as i32;
+    let y2 = (y2 as f32 * scale_y).round() as i32;
 
-    // Sort detections by confidence (highest first)
-    detections.sort_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+    // Ensure coordinates are within image bounds
+    let bbox = [
+        x1.max(0),
+        y1.max(0),
+        x2.min(original_width as i32),
+        y2.min(original_height as i32),
+    ];
 
-    let final_boxes = cluster_boxes(&mut detections);
-
-    Ok(final_boxes)
+    Detection { bbox, confidence }
 }

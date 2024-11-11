@@ -786,6 +786,7 @@ dependencies = [
  "image",
  "ndarray",
  "ort",
+ "rayon",
  "serde",
 ]
 
