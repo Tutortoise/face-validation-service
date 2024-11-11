@@ -1,30 +1,37 @@
-use actix_web::{middleware, web, App, HttpResponse, HttpServer, Responder};
-use serde::Serialize;
+mod clustering;
+mod detection;
+mod handlers;
+mod types;
 
-#[derive(Serialize)]
-struct HelloResponse {
-    message: String,
-}
-
-async fn hello() -> impl Responder {
-    let response = HelloResponse {
-        message: "Hello, World!".to_string(),
-    };
-    HttpResponse::Ok().json(response)
-}
+use actix_web::{middleware, web, App, HttpServer};
+use handlers::validate_face;
+use ort::Environment;
+use std::sync::Arc;
+use types::AppState;
 
 #[actix_web::main]
 async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
 
-    println!("Server starting at http://127.0.0.1:8080");
+    let environment = Arc::new(
+        Environment::builder()
+            .with_name("face-validation")
+            .build()
+            .unwrap(),
+    );
 
-    HttpServer::new(|| {
+    let model_path = "models/yolo11n_9ir_640_hface.onnx".to_string();
+
+    HttpServer::new(move || {
         App::new()
+            .app_data(web::Data::new(AppState {
+                environment: environment.clone(),
+                model_path: model_path.clone(),
+            }))
             .wrap(middleware::Logger::new("%r %s %D ms"))
             .wrap(middleware::Compress::default())
             .wrap(middleware::NormalizePath::trim())
-            .route("/hello", web::get().to(hello))
+            .service(validate_face)
     })
     .bind("127.0.0.1:8080")?
     .run()

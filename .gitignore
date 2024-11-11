@@ -13,3 +13,4 @@ dataset
 # Added by cargo
 
 /target
+sym_shape_infer_temp.onnx
