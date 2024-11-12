@@ -3,18 +3,24 @@ use crate::{
     types::{Detection, CONF_THRESHOLD, INPUT_SIZE},
 };
 use image::DynamicImage;
+use lazy_static::lazy_static;
 use ndarray::{Array, ArrayView1, CowArray};
 use ort::{Session, Value};
+use parking_lot::Mutex;
 use rayon::prelude::*;
+use std::num::NonZeroUsize;
+
+lazy_static! {
+    static ref INPUT_BUFFER_CACHE: Mutex<lru::LruCache<usize, Vec<f32>>> =
+        Mutex::new(lru::LruCache::new(NonZeroUsize::new(5).unwrap()));
+}
 
 pub async fn process_image(
     image: DynamicImage,
     session: &Session,
 ) -> Result<Vec<[i32; 4]>, Box<dyn std::error::Error>> {
-    // Store original dimensions
     let original_width = image.width();
     let original_height = image.height();
-
     let rgb_image = image.to_rgb8();
 
     let resized = image::imageops::resize(
@@ -24,18 +30,27 @@ pub async fn process_image(
         image::imageops::FilterType::Triangle,
     );
 
-    let mut input_data = Vec::with_capacity((INPUT_SIZE.0 * INPUT_SIZE.1 * 3) as usize);
+    // Try to get cached buffer
+    let buffer_size = (INPUT_SIZE.0 * INPUT_SIZE.1 * 3) as usize;
+    let mut input_data = {
+        let mut cache = INPUT_BUFFER_CACHE.lock();
+        cache
+            .get(&buffer_size)
+            .cloned()
+            .unwrap_or_else(|| Vec::with_capacity(buffer_size))
+    };
+    input_data.clear();
+
+    // Process image data
     for c in 0..3 {
-        let channel_data: Vec<f32> = (0..INPUT_SIZE.1)
-            .into_par_iter()
-            .flat_map(|y| {
-                let row_pixels: Vec<f32> = (0..INPUT_SIZE.0)
-                    .map(|x| resized.get_pixel(x, y)[c] as f32 / 255.0)
-                    .collect();
-                row_pixels
-            })
-            .collect();
+        let channel_data: Vec<f32> = process_channel(&resized, c);
         input_data.extend(channel_data);
+    }
+
+    // Cache the buffer for reuse
+    {
+        let mut cache = INPUT_BUFFER_CACHE.lock();
+        cache.put(buffer_size, input_data.clone());
     }
 
     // Create input tensor
@@ -87,6 +102,21 @@ pub async fn process_image(
     detections.par_sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
 
     Ok(cluster_boxes(&mut detections))
+}
+
+#[inline(always)]
+fn process_channel(
+    resized: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    channel: usize,
+) -> Vec<f32> {
+    (0..INPUT_SIZE.1)
+        .into_par_iter()
+        .flat_map(|y| {
+            (0..INPUT_SIZE.0)
+                .map(|x| resized.get_pixel(x, y)[channel] as f32 / 255.0)
+                .collect::<Vec<f32>>()
+        })
+        .collect()
 }
 
 #[inline(always)]

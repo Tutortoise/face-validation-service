@@ -1,3 +1,4 @@
+mod cache;
 mod clustering;
 mod detection;
 mod handlers;

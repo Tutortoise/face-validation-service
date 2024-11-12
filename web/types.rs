@@ -1,7 +1,14 @@
+use crate::cache::CachedSession;
 use ort::Environment;
 use serde::Serialize;
 
+use lazy_static::lazy_static;
+use parking_lot::RwLock;
 use std::{fmt, sync::Arc};
+
+lazy_static! {
+    pub(crate) static ref CACHED_SESSION: RwLock<Option<CachedSession>> = RwLock::new(None);
+}
 
 // Constants
 pub const INPUT_SIZE: (u32, u32) = (640, 640);
