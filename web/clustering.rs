@@ -131,13 +131,18 @@ pub fn safe_f64_cmp(a: &f64, b: &f64) -> std::cmp::Ordering {
     }
 }
 
+#[inline(always)]
 pub fn merge_boxes(boxes: &[[i32; 4]]) -> [i32; 4] {
-    let mut min_x = i32::MAX;
-    let mut min_y = i32::MAX;
-    let mut max_x = i32::MIN;
-    let mut max_y = i32::MIN;
+    if boxes.is_empty() {
+        return [0, 0, 0, 0];
+    }
 
-    for bbox in boxes {
+    let mut min_x = boxes[0][0];
+    let mut min_y = boxes[0][1];
+    let mut max_x = boxes[0][2];
+    let mut max_y = boxes[0][3];
+
+    for bbox in boxes.iter().skip(1) {
         min_x = min_x.min(bbox[0]);
         min_y = min_y.min(bbox[1]);
         max_x = max_x.max(bbox[2]);
@@ -146,6 +151,7 @@ pub fn merge_boxes(boxes: &[[i32; 4]]) -> [i32; 4] {
 
     [min_x, min_y, max_x, max_y]
 }
+
 pub fn convert_to_corners(box_coords: &[i32; 4]) -> [i32; 4] {
     let [x_center, y_center, width, height] = *box_coords;
     [

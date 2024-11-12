@@ -1,28 +1,87 @@
 use crate::{
     clustering::cluster_boxes,
-    types::{Detection, CONF_THRESHOLD, INPUT_SIZE},
+    types::{Detection, ProcessingError, CONF_THRESHOLD, INPUT_SIZE},
 };
 use image::DynamicImage;
 use lazy_static::lazy_static;
+use lru::LruCache;
+use nalgebra::{Vector2, Vector4};
 use ndarray::{Array, ArrayView1, CowArray};
 use ort::{Session, Value};
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use std::num::NonZeroUsize;
+use std::{sync::Arc, time::Duration};
+use tokio::time::timeout;
+
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::*;
+
+const PROCESSING_TIMEOUT: Duration = Duration::from_secs(10);
+const RETRY_ATTEMPTS: u32 = 3;
+const RETRY_DELAY_MS: u64 = 100;
 
 lazy_static! {
-    static ref INPUT_BUFFER_CACHE: Mutex<lru::LruCache<usize, Vec<f32>>> =
-        Mutex::new(lru::LruCache::new(NonZeroUsize::new(5).unwrap()));
+    pub(crate) static ref INPUT_BUFFER_CACHE: Mutex<LruCache<usize, Vec<f32>>> =
+        Mutex::new(LruCache::new(std::num::NonZeroUsize::new(5).unwrap()));
+}
+
+pub fn cleanup_input_buffer_cache() {
+    INPUT_BUFFER_CACHE.lock().clear();
+}
+
+pub fn cleanup_old_buffers() {
+    let mut cache = INPUT_BUFFER_CACHE.lock();
+    cache.clear();
 }
 
 pub async fn process_image(
     image: DynamicImage,
+    session: Arc<Session>, // Change the parameter type to Arc<Session>
+) -> Result<Vec<[i32; 4]>, ProcessingError> {
+    let mut last_error = None;
+
+    for attempt in 1..=RETRY_ATTEMPTS {
+        let image_clone = image.clone();
+        let session_clone = Arc::clone(&session); // Clone the Arc, not the session directly
+
+        let processing =
+            tokio::spawn(async move { process_image_internal(image_clone, &session_clone) });
+
+        match timeout(PROCESSING_TIMEOUT, processing).await {
+            Ok(Ok(Ok(boxes))) => return Ok(boxes),
+            Ok(Ok(Err(e))) => {
+                last_error = Some(e);
+                if attempt < RETRY_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(
+                        (RETRY_DELAY_MS as u64) * (attempt as u64),
+                    ))
+                    .await;
+                    continue;
+                }
+            }
+            Ok(Err(e)) => {
+                last_error = Some(ProcessingError::Internal(e.to_string()));
+            }
+            Err(_) => {
+                last_error = Some(ProcessingError::Timeout);
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| ProcessingError::Internal("Unknown error".to_string())))
+}
+
+fn process_image_internal(
+    image: DynamicImage,
     session: &Session,
-) -> Result<Vec<[i32; 4]>, Box<dyn std::error::Error>> {
+) -> Result<Vec<[i32; 4]>, ProcessingError> {
     let original_width = image.width();
     let original_height = image.height();
+
+    // Convert image to RGB
     let rgb_image = image.to_rgb8();
 
+    // Resize image
     let resized = image::imageops::resize(
         &rgb_image,
         INPUT_SIZE.0,
@@ -30,8 +89,23 @@ pub async fn process_image(
         image::imageops::FilterType::Triangle,
     );
 
-    // Try to get cached buffer
+    // Prepare input buffer
+    let input_data = prepare_input_buffer(&resized)?;
+
+    // Run inference
+    let predictions = run_inference(session, input_data)?;
+
+    let mut detections = process_predictions(predictions, original_width, original_height)?;
+
+    Ok(cluster_boxes(&mut detections))
+}
+
+fn prepare_input_buffer(
+    resized: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+) -> Result<Vec<f32>, ProcessingError> {
     let buffer_size = (INPUT_SIZE.0 * INPUT_SIZE.1 * 3) as usize;
+
+    // Get or create buffer from cache
     let mut input_data = {
         let mut cache = INPUT_BUFFER_CACHE.lock();
         cache
@@ -41,10 +115,14 @@ pub async fn process_image(
     };
     input_data.clear();
 
-    // Process image data
+    // Process channels with error recovery
     for c in 0..3 {
-        let channel_data: Vec<f32> = process_channel(&resized, c);
-        input_data.extend(channel_data);
+        match process_channel_safely(resized, c) {
+            Ok(channel_data) => input_data.extend(channel_data),
+            Err(_) => {
+                input_data.extend(process_channel_fallback(resized, c));
+            }
+        }
     }
 
     // Cache the buffer for reuse
@@ -53,38 +131,89 @@ pub async fn process_image(
         cache.put(buffer_size, input_data.clone());
     }
 
-    // Create input tensor
-    let shape = [1, 3, INPUT_SIZE.0 as usize, INPUT_SIZE.1 as usize];
-    let array = Array::from_shape_vec(shape, input_data)?;
+    Ok(input_data)
+}
 
-    // Ensure proper memory layout
+fn process_channel_safely(
+    resized: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    channel: usize,
+) -> Result<Vec<f32>, ProcessingError> {
+    #[cfg(target_arch = "x86_64")]
+    if is_x86_feature_detected!("avx2") {
+        return Ok(unsafe { process_channel_simd(resized.as_raw(), channel) });
+    }
+
+    Ok(process_channel_fallback(resized, channel))
+}
+
+fn process_channel_fallback(
+    resized: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
+    channel: usize,
+) -> Vec<f32> {
+    let pixels = resized.as_raw();
+    let mut result = Vec::with_capacity((INPUT_SIZE.0 * INPUT_SIZE.1) as usize);
+
+    for i in (channel..pixels.len()).step_by(3) {
+        result.push(pixels[i] as f32 / 255.0);
+    }
+
+    result
+}
+
+fn run_inference(
+    session: &Session,
+    input_data: Vec<f32>,
+) -> Result<ndarray::Array2<f32>, ProcessingError> {
+    let shape = [1, 3, INPUT_SIZE.0 as usize, INPUT_SIZE.1 as usize];
+
+    // Create array from input data
+    let array = Array::from_shape_vec(shape, input_data)
+        .map_err(|e| ProcessingError::Internal(format!("Failed to create input array: {}", e)))?;
+
+    // Prepare input tensor
     let array = array.as_standard_layout().to_owned();
     let cow_array = CowArray::from(array);
     let cow_array_dyn = cow_array.into_dyn();
 
-    // Run inference
-    let input_tensor = Value::from_array(session.allocator(), &cow_array_dyn)?;
-    let outputs = session.run(vec![input_tensor])?;
+    let input_tensor = Value::from_array(session.allocator(), &cow_array_dyn).map_err(|e| {
+        ProcessingError::InferenceError(format!("Failed to create input tensor: {}", e))
+    })?;
 
-    // Process output with careful handling of dimensions
-    let output_tensor = outputs[0].try_extract::<f32>()?;
+    // Run inference
+    let outputs = session
+        .run(vec![input_tensor])
+        .map_err(|e| ProcessingError::InferenceError(format!("Model inference failed: {}", e)))?;
+
+    // Process output tensor
+    let output_tensor = outputs[0].try_extract::<f32>().map_err(|e| {
+        ProcessingError::InferenceError(format!("Failed to extract output tensor: {}", e))
+    })?;
+
     let output_view = output_tensor.view();
 
-    let predictions = output_view
+    // Reshape predictions
+    output_view
         .to_owned()
-        .into_shape((1, 5, 8400))?
+        .into_shape((1, 5, 8400))
+        .map_err(|e| ProcessingError::Internal(format!("Failed to reshape output: {}", e)))?
         .permuted_axes([2, 1, 0])
         .as_standard_layout()
         .to_owned()
-        .into_shape((8400, 5))?;
+        .into_shape((8400, 5))
+        .map_err(|e| ProcessingError::Internal(format!("Failed to reshape predictions: {}", e)))
+}
 
+fn process_predictions(
+    predictions: ndarray::Array2<f32>,
+    original_width: u32,
+    original_height: u32,
+) -> Result<Vec<Detection>, ProcessingError> {
     let detections: Vec<Detection> = predictions
         .axis_iter(ndarray::Axis(0))
         .par_bridge()
         .filter_map(|prediction| {
             let confidence = prediction[4];
             if confidence >= CONF_THRESHOLD {
-                // Process detection in parallel
                 Some(create_detection(
                     prediction,
                     original_width,
@@ -97,26 +226,68 @@ pub async fn process_image(
         })
         .collect();
 
-    // Sort after parallel processing
     let mut detections = detections;
-    detections.par_sort_unstable_by(|a, b| b.confidence.partial_cmp(&a.confidence).unwrap());
+    detections.par_sort_unstable_by(|a, b| {
+        b.confidence
+            .partial_cmp(&a.confidence)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
 
-    Ok(cluster_boxes(&mut detections))
+    Ok(detections)
 }
 
+#[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn process_channel(
-    resized: &image::ImageBuffer<image::Rgb<u8>, Vec<u8>>,
-    channel: usize,
-) -> Vec<f32> {
-    (0..INPUT_SIZE.1)
-        .into_par_iter()
-        .flat_map(|y| {
-            (0..INPUT_SIZE.0)
-                .map(|x| resized.get_pixel(x, y)[channel] as f32 / 255.0)
-                .collect::<Vec<f32>>()
-        })
-        .collect()
+unsafe fn process_channel_simd(pixels: &[u8], channel: usize) -> Vec<f32> {
+    let len = pixels.len();
+    let mut result: Vec<f32> = Vec::with_capacity(len / 3);
+    let mut i = channel;
+
+    // Process 16 pixels at a time using two AVX2 registers
+    while i + 48 <= len {
+        let mut values: [f32; 16] = [0.0; 16];
+        for j in 0..16 {
+            values[j] = pixels[i + j * 3] as f32;
+        }
+
+        // Process first 8 pixels
+        let pixels_f32_1 = _mm256_loadu_ps(values.as_ptr());
+        let normalized_1 = _mm256_div_ps(pixels_f32_1, _mm256_set1_ps(255.0));
+
+        // Process next 8 pixels
+        let pixels_f32_2 = _mm256_loadu_ps(values.as_ptr().add(8));
+        let normalized_2 = _mm256_div_ps(pixels_f32_2, _mm256_set1_ps(255.0));
+
+        // Store results
+        _mm256_storeu_ps(result.as_mut_ptr().add(result.len()), normalized_1);
+        _mm256_storeu_ps(result.as_mut_ptr().add(result.len() + 8), normalized_2);
+
+        result.set_len(result.len() + 16);
+        i += 48; // Move forward 16 pixels * 3 channels
+    }
+
+    // Handle remaining pixels with original 8-pixel SIMD
+    while i + 24 <= len {
+        let mut values: [f32; 8] = [0.0; 8];
+        for j in 0..8 {
+            values[j] = pixels[i + j * 3] as f32;
+        }
+
+        let pixels_f32 = _mm256_loadu_ps(values.as_ptr());
+        let normalized = _mm256_div_ps(pixels_f32, _mm256_set1_ps(255.0));
+        _mm256_storeu_ps(result.as_mut_ptr().add(result.len()), normalized);
+
+        result.set_len(result.len() + 8);
+        i += 24;
+    }
+
+    // Handle remaining pixels
+    while i < len {
+        result.push(pixels[i] as f32 / 255.0);
+        i += 3;
+    }
+
+    result
 }
 
 #[inline(always)]
@@ -126,38 +297,38 @@ fn create_detection(
     original_height: u32,
     confidence: f32,
 ) -> Detection {
-    let x_center = prediction[0];
-    let y_center = prediction[1];
-    let width = prediction[2];
-    let height = prediction[3];
+    let pred_vec = Vector4::new(prediction[0], prediction[1], prediction[2], prediction[3]);
 
-    // Convert normalized coordinates to absolute pixel coordinates
-    let abs_x_center = x_center * INPUT_SIZE.0 as f32;
-    let abs_y_center = y_center * INPUT_SIZE.1 as f32;
-    let abs_width = width * INPUT_SIZE.0 as f32;
-    let abs_height = height * INPUT_SIZE.1 as f32;
+    let input_size = Vector4::new(
+        INPUT_SIZE.0 as f32,
+        INPUT_SIZE.1 as f32,
+        INPUT_SIZE.0 as f32,
+        INPUT_SIZE.1 as f32,
+    );
 
-    // Calculate corner coordinates in input size space
-    let x1 = (abs_x_center - abs_width / 2.0).round() as i32;
-    let y1 = (abs_y_center - abs_height / 2.0).round() as i32;
-    let x2 = (abs_x_center + abs_width / 2.0).round() as i32;
-    let y2 = (abs_y_center + abs_height / 2.0).round() as i32;
+    let abs_coords = pred_vec.component_mul(&input_size);
+    let [abs_x_center, abs_y_center, abs_width, abs_height] =
+        [abs_coords[0], abs_coords[1], abs_coords[2], abs_coords[3]];
 
-    // Scale to original image size
-    let scale_x = original_width as f32 / INPUT_SIZE.0 as f32;
-    let scale_y = original_height as f32 / INPUT_SIZE.1 as f32;
+    let half_sizes = Vector2::new(abs_width / 2.0, abs_height / 2.0);
+    let center = Vector2::new(abs_x_center, abs_y_center);
 
-    let x1 = (x1 as f32 * scale_x).round() as i32;
-    let y1 = (y1 as f32 * scale_y).round() as i32;
-    let x2 = (x2 as f32 * scale_x).round() as i32;
-    let y2 = (y2 as f32 * scale_y).round() as i32;
+    let corners_min = center - half_sizes;
+    let corners_max = center + half_sizes;
 
-    // Ensure coordinates are within image bounds
+    let scale = Vector2::new(
+        original_width as f32 / INPUT_SIZE.0 as f32,
+        original_height as f32 / INPUT_SIZE.1 as f32,
+    );
+
+    let scaled_min = (corners_min.component_mul(&scale)).map(|x| x.round() as i32);
+    let scaled_max = (corners_max.component_mul(&scale)).map(|x| x.round() as i32);
+
     let bbox = [
-        x1.max(0),
-        y1.max(0),
-        x2.min(original_width as i32),
-        y2.min(original_height as i32),
+        scaled_min.x.max(0),
+        scaled_min.y.max(0),
+        scaled_max.x.min(original_width as i32),
+        scaled_max.y.min(original_height as i32),
     ];
 
     Detection { bbox, confidence }
