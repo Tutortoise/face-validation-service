@@ -1,0 +1,30 @@
+# Version control
+.git
+.gitignore
+
+# IDE specific files
+.idea
+.vscode
+*.swp
+*.swo
+
+# Build artifacts
+*.exe
+*.test
+*.out
+
+# Dependencies
+vendor/
+
+# Directories not needed for the build
+benchmark/
+example/
+notebook/
+scripts/
+
+# Temporary files
+sym_shape_infer_temp.onnx
+
+# Do NOT ignore these
+!web/lib/
+!models/*.onnx

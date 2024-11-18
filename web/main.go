@@ -132,14 +132,11 @@ type ErrorResponse struct {
 }
 
 func main() {
-	// Add basic logging
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
-	// Set up model path
-	modelPath := filepath.Clean("../models/yolo11n_9ir_256_haface.onnx")
-	absModelPath, err := filepath.Abs(modelPath)
+	libPath, absModelPath, err := extractFiles("")
 	if err != nil {
-		log.Fatalf("Failed to get absolute path for model: %v", err)
+		log.Fatalf("Failed to extract embedded files: %v", err)
 	}
 
 	// Extract embedded files
