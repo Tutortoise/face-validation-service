@@ -2,30 +2,47 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"github.com/Tutortoise/face-validation-service/detections"
-	"github.com/Tutortoise/face-validation-service/models"
 	"image"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"runtime"
+	"strconv"
+	"syscall"
 	"time"
+
+	"github.com/Tutortoise/face-validation-service/detections"
+	"github.com/Tutortoise/face-validation-service/models"
 
 	"github.com/gorilla/mux"
 	ort "github.com/yalue/onnxruntime_go"
 )
 
 var (
-	debugMode bool
+	debugMode           bool
+	modelOutputChannels = int64(6)
+	modelOutputGridSize = int64(1344)
 )
 
 func init() {
 	debugMode = os.Getenv("DEBUG") == "true"
+	if envChannels := os.Getenv("MODEL_OUTPUT_CHANNELS"); envChannels != "" {
+		if c, err := strconv.ParseInt(envChannels, 10, 64); err == nil {
+			modelOutputChannels = c
+		}
+	}
+	if envGridSize := os.Getenv("MODEL_OUTPUT_GRID_SIZE"); envGridSize != "" {
+		if g, err := strconv.ParseInt(envGridSize, 10, 64); err == nil {
+			modelOutputGridSize = g
+		}
+	}
 }
 
 func logTimings(t *models.ProcessingTimings) {
@@ -58,9 +75,11 @@ func initSession(modelPath string) (*detections.ModelSession, error) {
 
 	options.SetIntraOpNumThreads(runtime.NumCPU())
 	options.SetInterOpNumThreads(runtime.NumCPU())
+	options.SetMemPattern(true)
+	options.SetCpuMemArena(true)
 
 	inputShape := ort.NewShape(1, 3, detections.InputWidth, detections.InputHeight)
-	outputShape := ort.NewShape(1, 5, 8400)
+	outputShape := ort.NewShape(1, modelOutputChannels, modelOutputGridSize) // Use configurable values
 
 	inputTensor, err := ort.NewEmptyTensor[float32](inputShape)
 	if err != nil {
@@ -117,7 +136,7 @@ func main() {
 	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	// Set up model path
-	modelPath := filepath.Clean("../models/yolo11n_9ir_640_hface.onnx")
+	modelPath := filepath.Clean("../models/yolo11n_9ir_256_haface.onnx")
 	absModelPath, err := filepath.Abs(modelPath)
 	if err != nil {
 		log.Fatalf("Failed to get absolute path for model: %v", err)
@@ -160,15 +179,41 @@ func main() {
 	r.HandleFunc("/validate-face", handleValidateFace(state)).Methods("POST")
 	state.addMonitoringRoutes(r)
 
-	srv := &http.Server{
-		Handler:      r,
-		Addr:         "127.0.0.1:8080",
-		WriteTimeout: 60 * time.Second,
-		ReadTimeout:  60 * time.Second,
+	port := os.Getenv("PORT")
+	if port == "" {
+		port = "8080"
 	}
 
+	srv := &http.Server{
+		Handler:      r,
+		Addr:         "0.0.0.0:" + port,
+		WriteTimeout: 60 * time.Second,
+		ReadTimeout:  60 * time.Second,
+		IdleTimeout:  120 * time.Second,
+	}
+
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	go func() {
+		<-stop
+		log.Println("Shutting down gracefully...")
+
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("Error during shutdown: %v", err)
+		}
+
+		pool.Destroy()
+		ort.DestroyEnvironment()
+	}()
+
 	log.Printf("Starting server on %s", srv.Addr)
-	log.Fatal(srv.ListenAndServe())
+	if err := srv.ListenAndServe(); err != http.ErrServerClosed {
+		log.Fatalf("Server error: %v", err)
+	}
 }
 
 func handleValidateFace(state *AppState) http.HandlerFunc {
@@ -238,6 +283,10 @@ func handleValidateFace(state *AppState) http.HandlerFunc {
 }
 
 func (s *AppState) addMonitoringRoutes(r *mux.Router) {
+	r.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+	}).Methods("GET")
 	r.HandleFunc("/metrics", s.handleMetrics).Methods("GET")
 }
 

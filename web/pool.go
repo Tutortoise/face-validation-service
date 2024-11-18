@@ -9,10 +9,9 @@ import (
 )
 
 const (
-	// Pool configuration
+	// DefaultPoolSize Pool configuration
 	DefaultPoolSize   = 4
 	AcquireTimeout    = 5 * time.Second
-	MaxIdleTime       = 30 * time.Second
 	HealthCheckPeriod = 60 * time.Second
 )
 

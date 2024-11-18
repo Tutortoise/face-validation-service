@@ -4,24 +4,33 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/Tutortoise/face-validation-service/clustering"
-	"github.com/Tutortoise/face-validation-service/models"
 	"image"
 	"runtime"
 	"sort"
 	"sync"
 	"time"
-	"unsafe"
+
+	"github.com/Tutortoise/face-validation-service/clustering"
+	"github.com/Tutortoise/face-validation-service/models"
 
 	"github.com/disintegration/imaging"
 	ort "github.com/yalue/onnxruntime_go"
-	"golang.org/x/sys/cpu"
 )
 
 type ModelSession struct {
-	Session *ort.AdvancedSession
-	Input   *ort.Tensor[float32]
-	Output  *ort.Tensor[float32]
+	Session      *ort.AdvancedSession
+	Input        *ort.Tensor[float32]
+	Output       *ort.Tensor[float32]
+	preprocessor *SIMDPreprocessor
+}
+
+func NewModelSession(session *ort.AdvancedSession, input, output *ort.Tensor[float32]) *ModelSession {
+	return &ModelSession{
+		Session:      session,
+		Input:        input,
+		Output:       output,
+		preprocessor: NewSIMDPreprocessor(),
+	}
 }
 
 func (m *ModelSession) Destroy() {
@@ -120,26 +129,6 @@ func processImageInternal(img image.Image, model *ModelSession, timings *models.
 	return boxes, nil
 }
 
-var useAVX2 = cpu.X86.HasAVX2
-
-func processBufferAVX2(buffer []float32, pic image.Image, channelSize int) {
-	switch img := pic.(type) {
-	case *image.RGBA:
-		for y := 0; y < InputHeight; y++ {
-			srcRow := unsafe.Pointer(&img.Pix[y*img.Stride])
-			dstR := unsafe.Pointer(&buffer[y*InputWidth])
-			dstG := unsafe.Pointer(&buffer[channelSize+y*InputWidth])
-			dstB := unsafe.Pointer(&buffer[channelSize*2+y*InputWidth])
-
-			processRowAVX2(dstR, srcRow, InputWidth)
-			processRowAVX2(dstG, unsafe.Pointer(uintptr(srcRow)+1), InputWidth)
-			processRowAVX2(dstB, unsafe.Pointer(uintptr(srcRow)+2), InputWidth)
-		}
-	default:
-		processBufferGeneric(buffer, pic, channelSize)
-	}
-}
-
 func processBufferGeneric(buffer []float32, pic image.Image, channelSize int) {
 	for y := 0; y < InputHeight; y++ {
 		offset := y * InputWidth
@@ -153,33 +142,58 @@ func processBufferGeneric(buffer []float32, pic image.Image, channelSize int) {
 	}
 }
 
+var preprocessor = NewSIMDPreprocessor()
+
 func prepareInput(pic image.Image, dst *ort.Tensor[float32]) error {
-	data := dst.GetData()
-	channelSize := InputWidth * InputHeight
-
-	// Get buffer from pool
-	buffer := bufferPool.Get().([]float32)
-	defer bufferPool.Put(buffer)
-
-	if useAVX2 && runtime.GOARCH == "amd64" {
-		processBufferAVX2(buffer, pic, channelSize)
-	} else {
-		// Use the existing parallel implementation for non-AVX2 systems
-		processBufferGeneric(buffer, pic, channelSize)
-	}
-
-	// Efficient copy to tensor
-	copy(data, buffer)
+	preprocessor := NewSIMDPreprocessor()
+	buffer := preprocessor.Process(pic)
+	copy(dst.GetData(), buffer)
 	return nil
 }
 
+func (p *SIMDPreprocessor) processParallel(img image.Image, buffer []float32) {
+	channelSize := p.width * p.height
+	rowsPerWorker := p.height / p.numWorkers
+
+	var wg sync.WaitGroup
+	wg.Add(p.numWorkers)
+
+	for w := 0; w < p.numWorkers; w++ {
+		startRow := w * rowsPerWorker
+		endRow := (w + 1) * rowsPerWorker
+		if w == p.numWorkers-1 {
+			endRow = p.height
+		}
+
+		go func(start, end int) {
+			defer wg.Done()
+			for y := start; y < end; y++ {
+				offset := y * p.width
+				for x := 0; x < p.width; x++ {
+					i := offset + x
+					r, g, b, _ := img.At(x, y).RGBA()
+					buffer[i] = float32(r>>8) / 255.0
+					buffer[channelSize+i] = float32(g>>8) / 255.0
+					buffer[channelSize*2+i] = float32(b>>8) / 255.0
+				}
+			}
+		}(startRow, endRow)
+	}
+
+	wg.Wait()
+}
+
 func processPredictions(predictions []float32, originalWidth, originalHeight int) ([]models.Detection, error) {
-	numPredictions := 8400
+	numPredictions := 1344
 	threshold := float32(ConfThreshold)
 
-	detections := make([]models.Detection, 0, 100)
+	// Verify prediction array length
+	expectedSize := 6 * 1344 // 6 channels * 1344 predictions
+	if len(predictions) != expectedSize {
+		return nil, fmt.Errorf("unexpected predictions length: got %d, want %d", len(predictions), expectedSize)
+	}
 
-	// Create smaller chunks for better cache utilization
+	detections := make([]models.Detection, 0, 100)
 	const chunkSize = 512
 	numWorkers := runtime.NumCPU()
 	jobs := make(chan int, numWorkers)
@@ -201,14 +215,15 @@ func processPredictions(predictions []float32, originalWidth, originalHeight int
 				}
 
 				for i := start; i < end; i++ {
-					confidence := predictions[4*8400+i]
+					// Get confidence score from the 5th channel
+					confidence := predictions[4*1344+i]
 					if confidence >= threshold {
 						bbox := calculateBBox(
 							[]float32{
-								predictions[i],
-								predictions[8400+i],
-								predictions[2*8400+i],
-								predictions[3*8400+i],
+								predictions[i],        // x
+								predictions[1344+i],   // y
+								predictions[2*1344+i], // w
+								predictions[3*1344+i], // h
 							},
 							float32(originalWidth),
 							float32(originalHeight),

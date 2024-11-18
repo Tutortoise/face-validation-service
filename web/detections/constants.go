@@ -1,9 +1,9 @@
 package detections
 
 const (
-	InputWidth    = 640
-	InputHeight   = 640
-	ConfThreshold = 0.6
+	InputWidth    = 256
+	InputHeight   = 256
+	ConfThreshold = 0.8
 	RetryAttempts = 3
 	RetryDelayMs  = 100
 )

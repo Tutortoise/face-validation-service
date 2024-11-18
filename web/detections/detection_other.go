@@ -1,20 +1,17 @@
 //go:build !amd64
-// +build !amd64
 
 package detections
 
-import (
-	"image"
-	"unsafe"
-)
+import "unsafe"
 
-func processRowAVX2(dst, src unsafe.Pointer, width int) {
-	// This should never be called on non-amd64 platforms
-	// The processBufferAVX2 function should use processBufferGeneric instead
-	panic("processRowAVX2 called on unsupported platform")
+func processRowAVX512(dst, src unsafe.Pointer, width int) {
+    panic("AVX-512 not supported on this platform")
 }
 
-func processBufferAVX2(buffer []float32, pic image.Image, channelSize int) {
-	// Fallback to generic implementation on non-amd64 platforms
-	processBufferGeneric(buffer, pic, channelSize)
+func processRowAVX2(dst, src unsafe.Pointer, width int) {
+    panic("AVX2 not supported on this platform")
+}
+
+func processRowSSE41(dst, src unsafe.Pointer, width int) {
+    panic("SSE4.1 not supported on this platform")
 }
