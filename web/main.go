@@ -5,6 +5,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"github.com/Tutortoise/face-validation-service/detections"
+	"github.com/Tutortoise/face-validation-service/models"
 	"image"
 	"io"
 	"log"
@@ -18,41 +20,46 @@ import (
 	ort "github.com/yalue/onnxruntime_go"
 )
 
-const (
-	InputWidth     = 640
-	InputHeight    = 640
-	ConfThreshold  = 0.6
-	ProcessTimeout = 10
-	RetryAttempts  = 3
-	RetryDelayMs   = 100
+var (
+	debugMode bool
 )
 
-type ModelSession struct {
-	Session *ort.AdvancedSession
-	Input   *ort.Tensor[float32]
-	Output  *ort.Tensor[float32]
+func init() {
+	debugMode = os.Getenv("DEBUG") == "true"
 }
 
-func (m *ModelSession) Destroy() {
-	m.Session.Destroy()
-	m.Input.Destroy()
-	m.Output.Destroy()
+func logTimings(t *models.ProcessingTimings) {
+	if debugMode {
+		log.Printf("[DEBUG] RequestID: %s - Processing times:\n"+
+			"\tImage Decode: %v\n"+
+			"\tResize:      %v\n"+
+			"\tPreprocess:  %v\n"+
+			"\tInference:   %v\n"+
+			"\tPostprocess: %v\n"+
+			"\tClustering:  %v\n"+
+			"\tTotal:       %v",
+			t.RequestID,
+			t.ImageDecode,
+			t.Resize,
+			t.Preprocess,
+			t.Inference,
+			t.Postprocess,
+			t.Clustering,
+			t.Total)
+	}
 }
 
-func initSession(modelPath string) (*ModelSession, error) {
-	// Create session options with optimizations
+func initSession(modelPath string) (*detections.ModelSession, error) {
 	options, err := ort.NewSessionOptions()
 	if err != nil {
 		return nil, fmt.Errorf("error creating session options: %w", err)
 	}
 	defer options.Destroy()
 
-	// Enable optimization flags
 	options.SetIntraOpNumThreads(runtime.NumCPU())
 	options.SetInterOpNumThreads(runtime.NumCPU())
 
-	// Pre-allocate input/output tensors
-	inputShape := ort.NewShape(1, 3, InputWidth, InputHeight)
+	inputShape := ort.NewShape(1, 3, detections.InputWidth, detections.InputHeight)
 	outputShape := ort.NewShape(1, 5, 8400)
 
 	inputTensor, err := ort.NewEmptyTensor[float32](inputShape)
@@ -81,7 +88,7 @@ func initSession(modelPath string) (*ModelSession, error) {
 		return nil, fmt.Errorf("error creating session: %w", err)
 	}
 
-	return &ModelSession{
+	return &detections.ModelSession{
 		Session: session,
 		Input:   inputTensor,
 		Output:  outputTensor,
@@ -166,6 +173,10 @@ func main() {
 
 func handleValidateFace(state *AppState) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		startTotal := time.Now()
+		requestID := fmt.Sprintf("%d", time.Now().UnixNano())
+		timings := &models.ProcessingTimings{RequestID: requestID}
+
 		ctx := r.Context()
 		contentType := r.Header.Get("Content-Type")
 
@@ -187,7 +198,9 @@ func handleValidateFace(state *AppState) http.HandlerFunc {
 		}
 
 		// Decode image
+		decodeStart := time.Now()
 		img, err := decodeImage(imgBytes)
+		timings.ImageDecode = time.Since(decodeStart)
 		if err != nil {
 			sendErrorResponse(w, "invalid_image", "Failed to decode image", http.StatusBadRequest)
 			return
@@ -202,12 +215,14 @@ func handleValidateFace(state *AppState) http.HandlerFunc {
 		defer state.Pool.Release(session)
 
 		// Process image using the acquired session
-		boxes, err := ProcessImage(ctx, img, session)
-
+		boxes, err := detections.ProcessImage(ctx, img, session, timings)
 		if err != nil {
 			sendErrorResponse(w, "processing_error", err.Error(), http.StatusInternalServerError)
 			return
 		}
+
+		timings.Total = time.Since(startTotal)
+		logTimings(timings)
 
 		// Create response
 		faceCount := len(boxes)
@@ -226,7 +241,7 @@ func (s *AppState) addMonitoringRoutes(r *mux.Router) {
 	r.HandleFunc("/metrics", s.handleMetrics).Methods("GET")
 }
 
-func (s *AppState) handleMetrics(w http.ResponseWriter, r *http.Request) {
+func (s *AppState) handleMetrics(w http.ResponseWriter, _ *http.Request) {
 	metrics := s.Pool.GetMetrics()
 	response := map[string]interface{}{
 		"pool_size":        s.Pool.size,

@@ -1,6 +1,7 @@
-package main
+package clustering
 
 import (
+	"github.com/Tutortoise/face-validation-service/models"
 	"math"
 	"sort"
 )
@@ -10,7 +11,7 @@ const (
 	IouThreshold       = 0.45
 )
 
-func clusterBoxes(detections []Detection) [][4]int32 {
+func ClusterBoxes(detections []models.Detection) [][4]int32 {
 	if len(detections) == 0 {
 		return nil
 	}
@@ -36,7 +37,7 @@ func clusterBoxes(detections []Detection) [][4]int32 {
 	return processClusters(detections, clusters)
 }
 
-func calculateMedianSize(detections []Detection) float64 {
+func calculateMedianSize(detections []models.Detection) float64 {
 	sizes := make([]float64, len(detections))
 	for i, det := range detections {
 		width := float64(det.BBox[2] - det.BBox[0])
@@ -51,7 +52,7 @@ func calculateMedianSize(detections []Detection) float64 {
 	return sizes[len(sizes)/2]
 }
 
-func processClusters(detections []Detection, clusters []int) [][4]int32 {
+func processClusters(detections []models.Detection, clusters []int) [][4]int32 {
 	clusterMap := make(map[int][][4]int32)
 	var finalBoxes [][4]int32
 

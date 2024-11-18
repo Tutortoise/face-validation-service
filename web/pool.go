@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/Tutortoise/face-validation-service/detections"
 	"sync"
 	"time"
 )
@@ -16,7 +17,7 @@ const (
 )
 
 type ModelSessionPool struct {
-	sessions   chan *ModelSession
+	sessions   chan *detections.ModelSession
 	size       int
 	modelPath  string
 	mu         sync.Mutex
@@ -40,7 +41,7 @@ func NewModelSessionPool(modelPath string, size int) (*ModelSessionPool, error) 
 	}
 
 	pool := &ModelSessionPool{
-		sessions:  make(chan *ModelSession, size),
+		sessions:  make(chan *detections.ModelSession, size),
 		size:      size,
 		modelPath: modelPath,
 		metrics:   &PoolMetrics{},
@@ -62,7 +63,7 @@ func NewModelSessionPool(modelPath string, size int) (*ModelSessionPool, error) 
 	return pool, nil
 }
 
-func (p *ModelSessionPool) Acquire(ctx context.Context) (*ModelSession, error) {
+func (p *ModelSessionPool) Acquire(ctx context.Context) (*detections.ModelSession, error) {
 	if p.closed {
 		return nil, fmt.Errorf("pool is closed")
 	}
@@ -91,7 +92,7 @@ func (p *ModelSessionPool) Acquire(ctx context.Context) (*ModelSession, error) {
 	}
 }
 
-func (p *ModelSessionPool) Release(session *ModelSession) {
+func (p *ModelSessionPool) Release(session *detections.ModelSession) {
 	if p.closed {
 		session.Destroy()
 		return

@@ -68,32 +68,6 @@ func extractLibrary(tmpDir string) (string, error) {
 	return tmpLib, nil
 }
 
-// extractModel extracts the model file
-func extractModel(tmpDir string) (string, error) {
-	modelName := "yolo11n_9ir_640_hface.onnx"
-
-	// Read embedded model
-	modelData, err := embeddedFiles.Open(filepath.Join("models", modelName))
-	if err != nil {
-		return "", err
-	}
-	defer modelData.Close()
-
-	// Create models directory
-	modelsDir := filepath.Join(tmpDir, "models")
-	if err := os.MkdirAll(modelsDir, 0755); err != nil {
-		return "", err
-	}
-
-	// Create temporary file for the model
-	tmpModel := filepath.Join(modelsDir, modelName)
-	if err := extractFile(modelData, tmpModel); err != nil {
-		return "", err
-	}
-
-	return tmpModel, nil
-}
-
 // extractFile is a helper function to extract a file
 func extractFile(src io.Reader, destPath string) error {
 	outFile, err := os.Create(destPath)
