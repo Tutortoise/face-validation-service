@@ -1,0 +1,11 @@
+steps:
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['build', '-t', 'asia-southeast2-docker.pkg.dev/${PROJECT_ID}/tutortoise/face-validation-service', '.']
+
+  # Docker Push
+- name: 'gcr.io/cloud-builders/docker'
+  args: ['push',
+         'asia-southeast2-docker.pkg.dev/${PROJECT_ID}/tutortoise/face-validation-service']
+
+options:
+  logging: CLOUD_LOGGING_ONLY
