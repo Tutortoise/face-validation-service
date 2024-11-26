@@ -337,11 +337,11 @@ func decodeImage(data []byte) (image.Image, error) {
 func getFaceValidationMessage(faceCount int) string {
 	switch {
 	case faceCount == 0:
-		return "No faces detected"
-	case faceCount == 1:
-		return "Valid single face detected"
+		return MsgNoFace
+	case faceCount > 1:
+		return MsgMultipleFaces
 	default:
-		return fmt.Sprintf("Multiple faces detected: %d", faceCount)
+		return MsgSingleFace
 	}
 }
 
