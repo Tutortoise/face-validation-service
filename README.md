@@ -1,5 +1,7 @@
 # Face Validation Service
 
+![](./service_architecture.jpg)
+
 A high-performance face detection and validation service built in Go that uses ONNX Runtime for inference. The service can detect and validate single/multiple faces in images with optimized processing using SIMD instructions.
 
 ## Features
@@ -230,9 +232,3 @@ This dual-dataset approach ensures the model:
 - Accurately detects human faces
 - Minimizes false positives from animated or illustrated faces
 - Provides robust performance in real-world applications
-
-## Acknowledgments
-
-- Face Detection Dataset from Kaggle
-- ONNX Runtime team
-- YOLOv11n developers
